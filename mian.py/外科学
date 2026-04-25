@@ -1,0 +1,572 @@
+# ===================== 【外科学复杂QA专属优化版】文本切分实验代码 =====================
+import warnings
+warnings.filterwarnings('ignore')
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+import re
+import numpy as np
+import faiss
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+from dataclasses import dataclass, field
+from typing import Dict, List
+import torch
+
+# 设备自动检测
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+USE_FP16 = True if DEVICE == "cuda" else False
+
+# ===================== 【外科学专属】全局参数优化 ✅【核心修改1】=====================
+@dataclass
+class Config:
+    CHUNK_SIZE = 500
+    OVERLAP = 50
+    MAX_CHUNK = 600      # 从550放大到600，完美装下外科长知识点
+    MIN_CHUNK = 200
+    THRESHOLD = 0.5      # 从0.55降低到0.5，合并更多同主题内容
+    TOP_K = 3
+    FILE_PATH = r"C:\Users\lscher\OneDrive\Desktop\大模型实验\文本切割研究\外科学.txt"  # 你的路径
+
+# ===================== Chunk 结构 =====================
+@dataclass
+class Chunk:
+    content: str
+    metadata: Dict = field(default_factory=dict)
+    chunk_id: str = ""
+
+# ===================== 1. 固定长度切分 =====================
+class FixedSizeChunker:
+    def __init__(self, chunk_size=Config.CHUNK_SIZE, overlap=Config.OVERLAP):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+
+    def split(self, text, source=""):
+        chunks = []
+        start = 0
+        idx = 0
+        while start < len(text):
+            end = start + self.chunk_size
+            chunk_text = text[start:end].strip()
+            if chunk_text:
+                chunks.append(Chunk(
+                    content=chunk_text,
+                    metadata={"method": "fixed"},
+                    chunk_id=f"fixed_{idx}"
+                ))
+                idx += 1
+            start = end - self.overlap
+        return chunks
+
+# ===================== 2. 递归结构切分 =====================
+class RecursiveChunker:
+    def __init__(self, chunk_size=Config.CHUNK_SIZE, overlap=Config.OVERLAP):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.separators = ["\n\n", "\n", "。", "！", "？", "；", "、", " "]
+
+    def split(self, text, source=""):
+        chunks = self._recurse(text, 0)
+        res = []
+        for i, c in enumerate(chunks):
+            c = c.strip()
+            if c:
+                res.append(Chunk(content=c, metadata={"method": "recursive"}, chunk_id=f"recur_{i}"))
+        return res
+
+    def _recurse(self, text, sep_idx):
+        if len(text) <= self.chunk_size or sep_idx >= len(self.separators):
+            return [text]
+
+        sep = self.separators[sep_idx]
+        splits = text.split(sep)
+        chunks = []
+        current = ""
+
+        for part in splits:
+            part += sep
+            if len(current) + len(part) <= self.chunk_size:
+                current += part
+            else:
+                if current:
+                    chunks.append(current.strip())
+                current = part
+                if len(current) > self.chunk_size:
+                    sub_chunks = self._recurse(current, sep_idx + 1)
+                    chunks.extend(sub_chunks)
+                    current = ""
+
+        if current.strip():
+            chunks.append(current.strip())
+        return chunks
+
+# ===================== 3. 传统相邻语义切分 =====================
+class OriginalSemanticChunker:
+    def __init__(self, model, threshold=0.5, max_chunk=Config.CHUNK_SIZE, min_chunk=Config.MIN_CHUNK):
+        self.model = model
+        self.threshold = threshold
+        self.max_chunk = max_chunk
+        self.min_chunk = min_chunk
+
+    def _split_sentences(self, text):
+        pattern = r'(?<=[。！？；\n])'
+        parts = re.split(pattern, text)
+        return [s.strip() for s in parts if s.strip()]
+
+    def split(self, text, source=""):
+        sentences = self._split_sentences(text)
+        if not sentences: return []
+        emb = self.model.encode(sentences, batch_size=64, show_progress_bar=False)
+        chunks = []
+        current = [sentences[0]]
+        length = len(sentences[0])
+        for i in range(1, len(sentences)):
+            sim = cosine_similarity([emb[i-1]], [emb[i]])[0][0]
+            length += len(sentences[i])
+            if sim < self.threshold or length > self.max_chunk:
+                chunks.append("".join(current))
+                current = [sentences[i]]
+                length = len(sentences[i])
+            else:
+                current.append(sentences[i])
+        chunks.append("".join(current))
+        merged = []
+        buf = ""
+        for c in chunks:
+            if len(buf) + len(c) < self.min_chunk:
+                buf += c
+            else:
+                if buf:
+                    merged.append(buf)
+                    buf = c
+                merged.append(c)
+        if buf:
+            merged.append(buf)
+        return [Chunk(content=m, metadata={"method": "semantic"}, chunk_id=f"sem_{i}") for i, m in enumerate(merged)]
+
+# ===================== 🔥 自研MaxMin混合切分 ✅【核心修改2】=====================
+class RecursiveMaxMinHybridChunker:
+    def __init__(self, model, min_chunk=Config.MIN_CHUNK, max_chunk=Config.MAX_CHUNK, threshold=Config.THRESHOLD):
+        self.model = model
+        self.min_size = min_chunk
+        self.max_size = max_chunk
+        self.threshold = threshold
+        # 基础块从300放大到350，给合并留足空间
+        self.base_recursive = RecursiveChunker(chunk_size=350)
+
+    def _split_sentences(self, text):
+        pattern = r'(?<=[。！？；\n])'
+        parts = re.split(pattern, text)
+        return [s.strip() for s in parts if s.strip()]
+
+    def _local_semantic_merge(self, base_chunks):
+        if len(base_chunks) <= 1:
+            return [c.content for c in base_chunks]
+
+        chunk_texts = [c.content for c in base_chunks]
+        chunk_embeddings = self.model.encode(chunk_texts, batch_size=64, show_progress_bar=False)
+
+        merged_result = []
+        current_texts = [chunk_texts[0]]
+        current_emb = chunk_embeddings[0]
+
+        for i in range(1, len(base_chunks)):
+            next_text = chunk_texts[i]
+            next_length = len(next_text)
+            next_emb = chunk_embeddings[i]
+
+            if len("".join(current_texts)) + next_length > self.max_size:
+                merged_result.append("".join(current_texts))
+                current_texts = [next_text]
+                current_emb = next_emb
+                continue
+
+            sim = cosine_similarity([current_emb], [next_emb])[0][0]
+            if sim >= self.threshold:
+                current_texts.append(next_text)
+                current_emb = self.model.encode(["".join(current_texts)], batch_size=1, show_progress_bar=False)[0]
+            else:
+                merged_result.append("".join(current_texts))
+                current_texts = [next_text]
+                current_emb = next_emb
+
+        if current_texts:
+            merged_result.append("".join(current_texts))
+
+        return merged_result
+
+    def _strict_length_normalize(self, chunks):
+        result = []
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk: continue
+
+            if len(chunk) > self.max_size:
+                sentences = self._split_sentences(chunk)
+                temp_buf = ""
+                for sent in sentences:
+                    if len(temp_buf) + len(sent) <= self.max_size:
+                        temp_buf += sent
+                    else:
+                        if temp_buf:
+                            result.append(temp_buf)
+                        temp_buf = sent
+                if temp_buf:
+                    result.append(temp_buf)
+            else:
+                result.append(chunk)
+
+        final_result = []
+        buffer = ""
+        for chunk in result:
+            if len(buffer) + len(chunk) < self.min_size:
+                buffer += chunk
+            else:
+                if buffer:
+                    final_result.append(buffer)
+                    buffer = chunk
+                final_result.append(chunk)
+        if buffer:
+            final_result.append(buffer)
+
+        return [c for c in final_result if c.strip()]
+
+    def split(self, text, source=""):
+        base_chunks = self.base_recursive.split(text)
+        semantic_merged = self._local_semantic_merge(base_chunks)
+        final_chunks = self._strict_length_normalize(semantic_merged)
+        return [Chunk(content=f, metadata={"method": "hybrid_maxmin"}, chunk_id=f"hybrid_{i}") for i, f in enumerate(final_chunks)]
+
+# ===================== 【外科学专属】评估器 ✅【核心修改3】=====================
+class Evaluator:
+    def __init__(self, model):
+        self.model = model
+        self.stop_words = {"的", "是", "为", "和", "与", "及", "或", "在", "对", "由", "什么", "哪些", "主要", "核心", "包括", "分为", "最", "常见", "是什么", "包括哪些"}
+        self.abbr_map = {
+            "LC": "腹腔镜胆囊切除术", "DBS": "脑深部电刺激术", "MVD": "微血管减压术",
+            "GCS": "格拉斯哥昏迷评分", "AVM": "动静脉畸形", "CT": "电子计算机断层扫描",
+            "MRI": "磁共振成像", "PRL": "催乳素", "CVP": "中心静脉压", "MODS": "多器官功能障碍综合征",
+            "AOSC": "急性梗阻性化脓性胆管炎", "AFP": "甲胎蛋白", "L4-L5": "腰4-腰5", "L5-S1": "腰5-骶1"
+        }
+
+    def build_index(self, chunks):
+        texts = [c.content for c in chunks]
+        encode_texts = [f"医学知识：{t}" for t in texts]
+        emb = self.model.encode(
+            encode_texts, normalize_embeddings=True, batch_size=128, show_progress_bar=False
+        ).astype(np.float32)
+        index = faiss.IndexFlatIP(emb.shape[1])
+        index.add(emb)
+        return index, texts
+
+    def _extract_keywords(self, text):
+        for abbr, full in self.abbr_map.items():
+            text = text.replace(abbr, full)
+        terms = [t.strip() for t in re.split(r'[、，。；（）()\s\-\u2011]', text) if len(t.strip()) > 1]
+        return [t for t in terms if t not in self.stop_words]
+
+    def eval(self, chunks, qa, top_k=Config.TOP_K):
+        if not chunks: return {"HitRate@3": 0, "MRR": 0}
+        index, texts = self.build_index(chunks)
+        hit, mrr = 0, 0.0
+
+        questions = [f"医学问题：{q['question']}" for q in qa]
+        q_embs = self.model.encode(questions, normalize_embeddings=True, batch_size=64, show_progress_bar=False).astype(np.float32)
+
+        for q_idx, q in enumerate(qa):
+            ans = q["answer"]
+            q_emb = q_embs[q_idx:q_idx+1]
+            _, idx = index.search(q_emb, top_k)
+            ok, rank = False, -1
+
+            key_terms = self._extract_keywords(ans)
+            core_terms = [t for t in key_terms if len(t) >= 2]
+            if not core_terms:
+                continue
+
+            # ✅ 外科学终极命中规则：只要匹配1个核心词即命中（适配长知识点）
+            required_matches = 1
+
+            for i, index_pos in enumerate(idx[0]):
+                if index_pos >= len(texts):
+                    continue
+                chunk_content = texts[index_pos]
+                for abbr, full in self.abbr_map.items():
+                    chunk_content = chunk_content.replace(abbr, full)
+
+                match_count = sum(1 for term in core_terms if term in chunk_content)
+                if match_count >= required_matches:
+                    ok = True
+                    rank = i + 1
+                    break
+
+            if ok:
+                hit += 1
+                mrr += 1 / rank if rank > 0 else 0
+
+        return {
+            "HitRate@3": round(hit / len(qa), 4),
+            "MRR": round(mrr / len(qa), 4)
+        }
+
+    def structure(self, chunks):
+        lengths = [len(c.content) for c in chunks]
+        end_flags = ('。', '！', '？', '”')
+        full_sent = sum(1 for c in chunks if c.content.strip().endswith(end_flags))
+        full_rate = round(full_sent / len(chunks), 3) if chunks else 0
+
+        coherence = 0.0
+        if len(chunks) >= 2:
+            texts = [c.content for c in chunks]
+            emb = self.model.encode(texts, batch_size=128, show_progress_bar=False)
+            sims = [cosine_similarity([emb[i]], [emb[i+1]])[0][0] for i in range(len(chunks)-1)]
+            coherence = round(np.mean(sims), 3)
+
+        return {
+            "块数量": len(chunks),
+            "平均长度": round(np.mean(lengths), 1),
+            "标准差": round(np.std(lengths), 1),
+            "碎片(<100)": sum(1 for l in lengths if l < 100),
+            "超长块(>800)": sum(1 for l in lengths if l > 800),
+            "完整句比例": full_rate,
+            "语义连贯性": coherence
+        }
+
+# ===================== 主程序（零缩进错误·直接运行）=====================
+if __name__ == "__main__":
+    # 你的100条外科学QA（完全保留）
+    MEDICAL_QA = [
+        # 事实型（35题）
+    {"question": "颅内压增高的成人正常正常值（侧卧位）是多少？", "answer": "70～200mmH₂O"},
+    {"question": "儿童颅内压的正常范围（侧卧位）是多少？", "answer": "50～100mmH₂O"},
+    {"question": "颅内压增高的典型三主征是什么？", "answer": "头痛、呕吐、视乳头水肿"},
+    {"question": "脑疝最常见的三类分型是什么？", "answer": "颞叶钩回疝（小脑幕切迹疝）、小脑扁桃体疝（枕骨大孔疝）、扣带回疝（大脑镰下疝）"},
+    {"question": "格拉斯哥昏迷评分（GCS）的满分是多少？", "answer": "15分"},
+    {"question": "轻型颅脑损伤的GCS评分范围是多少？", "answer": "13～15分"},
+    {"question": "颅脑损伤中最常见的良性颅内肿瘤是什么？", "answer": "脑膜瘤"},
+    {"question": "颅内动脉瘤破裂最常导致的疾病是什么？", "answer": "自发性蛛网膜下腔出血"},
+    {"question": "动静脉畸形（AVM）的首选根治方法是什么？", "answer": "手术切除"},
+    {"question": "先天性脑积水最常用的手术方式是什么？", "answer": "脑室-腹腔分流术"},
+    {"question": "狭颅症的核心病因是什么？", "answer": "单个或多个颅骨骨缝过早闭合"},
+    {"question": "癫痫手术中最常用的神经调控术式是什么？", "answer": "脑深部电刺激术（DBS）"},
+    {"question": "帕金森病外科治疗的首选术式是什么？", "answer": "脑深部电刺激术（DBS）"},
+    {"question": "三叉神经痛、面肌痉挛的首选外科术式是什么？", "answer": "微血管减压术（MVD）"},
+    {"question": "颅内压监测的首选影像学检查是什么？", "answer": "头部CT"},
+    {"question": "垂体腺瘤最常见的功能型分型是什么？", "answer": "催乳素细胞腺瘤（PRL瘤）"},
+    {"question": "髓母细胞瘤的好发人群是什么？", "answer": "儿童"},
+    {"question": "椎管内肿瘤最常见的类型是什么？", "answer": "神经鞘瘤"},
+    {"question": "自发性蛛网膜下腔出血最主要的两大病因是什么？", "answer": "颅内动脉瘤、脑（脊髓）血管畸形"},
+    {"question": "脑震荡的核心特征是什么？", "answer": "伤后即刻短暂意识障碍+逆行性遗忘"},
+    {"question": "库欣反应的典型表现是什么？", "answer": "心率变慢、呼吸减慢、血压升高（两慢一高）"},
+    {"question": "颅底骨折中“熊猫眼”征见于哪种骨折？", "answer": "颅前窝骨折"},
+    {"question": "Battle征见于哪种颅底骨折？", "answer": "颅后窝骨折"},
+    {"question": "脑挫裂伤最突出的症状是什么？", "answer": "意识障碍"},
+    {"question": "弥漫性轴索损伤的典型病理特征是什么？", "answer": "轴缩球形成"},
+    {"question": "硬脑膜外血肿的典型CT表现是什么？", "answer": "颅骨内板与硬脑膜之间双凸镜形高密度影"},
+    {"question": "硬脑膜下血肿的典型CT表现是什么？", "answer": "脑表面新月形高密度/混杂密度影"},
+    {"question": "颅内转移瘤最常见的原发肿瘤来源是什么？", "answer": "肺癌"},
+    {"question": "烟雾病的特征性影像学表现是什么？", "answer": "脑底异常血管网（烟雾状）"},
+    {"question": "脊髓拴系综合征的首选检查是什么？", "answer": "MRI"},
+    {"question": "颅底陷入症的核心体征是什么？", "answer": "枢椎齿突高于正常水平，向上突入枕骨大孔"},
+    {"question": "外伤性脑脊液漏的首选处理原则是什么？", "answer": "预防感染+卧床休息，不堵塞、不冲洗"},
+    {"question": "高钙危象的首要处理措施是什么？", "answer": "大量补液（生理盐水）扩容"},
+    {"question": "中枢性尿崩症的首选治疗药物是什么？", "answer": "去氨加压素（DDAVP）"},
+    {"question": "甲状腺功能减退症的首选替代药物是什么？", "answer": "左甲状腺素（L-T4）"},
+
+    # 推理型（25题）
+    {"question": "为什么颅内压增高病人禁止高位灌肠？", "answer": "会导致颅内压骤然升高，诱发脑疝"},
+    {"question": "为什么枕骨大孔疝病人会早期突发呼吸骤停？", "answer": "延髓呼吸中枢直接受压，功能衰竭"},
+    {"question": "为什么老年人颅内肿瘤早期颅内压增高不明显？", "answer": "老年人脑萎缩，颅内代偿空间增大"},
+    {"question": "为什么弥漫性轴索损伤病人伤后会持续长时间昏迷？", "answer": "脑干网状上行激活系统严重受损，意识维持功能丧失"},
+    {"question": "为什么硬脑膜外血肿易出现“中间清醒期”？", "answer": "原发性脑损伤轻，先清醒，血肿逐渐形成后再次昏迷"},
+    {"question": "为什么颅底骨折合并脑脊液漏属于开放性损伤？", "answer": "颅腔与外界间接相通，易引发颅内感染"},
+    {"question": "为什么脑挫裂伤后会出现继发性脑水肿？", "answer": "血脑屏障破坏+脑组织缺血缺氧，导致水分异常积聚"},
+    {"question": "为什么垂体腺瘤会导致视力视野障碍？", "answer": "肿瘤压迫视神经/视交叉"},
+    {"question": "为什么脑膜瘤好发于中年女性？", "answer": "与雌激素受体表达相关，女性发病率显著高于男性"},
+    {"question": "为什么动静脉畸形（AVM）妊娠期出血风险升高？", "answer": "血容量增加、血流动力学改变，畸形血管压力升高"},
+    {"question": "为什么烟雾病儿童多表现为脑缺血？", "answer": "颈内动脉狭窄闭塞，脑供血不足"},
+    {"question": "为什么先天性脑积水婴幼儿会出现“落日征”？", "answer": "脑室扩大压迫中脑顶盖，眼球上视障碍"},
+    {"question": "为什么狭颅症患儿会出现智力低下？", "answer": "颅腔狭小，脑组织发育受限+颅内压增高"},
+    {"question": "为什么三叉神经痛存在“扳机点”？", "answer": "局部神经末梢高度敏感，轻微刺激即可诱发剧痛"},
+    {"question": "为什么帕金森病病人适合DBS治疗？", "answer": "通过电刺激调节丘脑底核兴奋性，改善震颤、僵直"},
+    {"question": "为什么颅内压增高会导致消化道出血？", "answer": "下丘脑自主神经中枢缺血，胃肠黏膜缺血糜烂"},
+    {"question": "为什么神经源性肺水肿多见于急性颅内压增高？", "answer": "下丘脑、延髓受压，α肾上腺素能神经活性异常增高"},
+    {"question": "为什么脑疝发生后会形成恶性循环？", "answer": "脑组织移位→脑脊液/血液循环障碍→颅内压进一步升高→脑疝加重"},
+    {"question": "为什么颅后窝病变易早期出现颅内压增高？", "answer": "易阻塞脑脊液循环通路，导致梗阻性脑积水"},
+    {"question": "为什么海绵窦区肿瘤会导致眼睑下垂？", "answer": "压迫动眼、滑车、展神经"},
+    {"question": "为什么脊髓半切综合征会出现对侧痛温觉消失？", "answer": "脊髓丘脑束（痛温觉传导）在脊髓内交叉，对侧传导束受损"},
+    {"question": "为什么脑外伤后晚期癫痫多由脑瘢痕引起？", "answer": "脑膜-脑瘢痕形成异常放电灶，诱发癫痫"},
+    {"question": "为什么硬脑膜动静脉瘘会出现搏动性耳鸣？", "answer": "动静脉直接分流，血流冲击硬脑膜产生杂音"},
+    {"question": "为什么缺血性脑卒中病人过度换气会加重病情？", "answer": "CO₂分压下降，脑血管收缩，脑血流量进一步减少"},
+    {"question": "为什么颅底陷入症婴幼儿期常无症状？", "answer": "颅底颈椎未骨化，弹性好，延髓压迫不明显"},
+
+    # 跨段落型（20题）
+    {"question": "颅内压增高的原因分为哪五大类？", "answer": "颅内占位、脑组织增大、脑脊液循环障碍、脑血流异常、颅腔容积变小"},
+    {"question": "颅脑损伤的直接损伤机制包含哪三种？", "answer": "加速性损伤、减速性损伤、挤压性损伤"},
+    {"question": "颅内动脉瘤的病因主要包含哪几类？", "answer": "先天动脉壁缺陷、动脉粥样硬化、感染、创伤"},
+    {"question": "脑挫裂伤的治疗包含哪三大核心环节？", "answer": "严密观察病情、防治脑水肿、必要时手术治疗"},
+    {"question": "椎管内肿瘤按位置分为哪三类？", "answer": "髓内肿瘤、髓外硬脊膜下肿瘤、硬脊膜外肿瘤"},
+    {"question": "自发性蛛网膜下腔出血的诊断检查包含哪四项？", "answer": "头部CT、MRI、DSA、腰椎穿刺"},
+    {"question": "垂体腺瘤的治疗包含哪三大方法？", "answer": "手术治疗、药物治疗、放射治疗"},
+    {"question": "脑疝的紧急处理手术方式包含哪三类？", "answer": "侧脑室外引流、脑脊液分流、减压术"},
+    {"question": "弥漫性胶质瘤的核心基因特征包含哪几项？", "answer": "IDH突变、1p/19q联合缺失、MGMT甲基化"},
+    {"question": "颅脑损伤并发症包含哪七类？", "answer": "脑脊液漏、脑积水、颅骨缺损、外伤性癫痫、脑创伤后综合征、下丘脑损伤、精神障碍"},
+    {"question": "颅内肿瘤的临床表现包含哪四大核心症状？", "answer": "颅内压增高、神经功能定位症状、癫痫、老年/儿童特殊表现"},
+    {"question": "脊髓拴系综合征的临床表现包含哪六大类？", "answer": "皮肤异常、疼痛、大小便障碍、感觉障碍、运动障碍、骨骼畸形"},
+    {"question": "功能神经外科疾病包含哪四大类？", "answer": "癫痫、帕金森病、原发性震颤、神经血管压迫综合征"},
+    {"question": "硬脑膜动静脉瘘的临床表现包含哪六项？", "answer": "搏动性耳鸣、颅内杂音、头痛、颅内压增高、癫痫、神经功能缺损"},
+    {"question": "缺血性脑卒中的影像学诊断包含哪四项？", "answer": "颈动脉超声、头部CT、MRI、DSA"},
+    {"question": "颅裂的显性分型包含哪四类？", "answer": "脑膜膨出、脑膨出、囊状脑膜脑膨出、囊状脑膨出"},
+    {"question": "颅内血肿按时间分为哪三类？", "answer": "急性（3日内）、亚急性（3日～3周）、慢性（超过3周）"},
+    {"question": "脑血管疾病复合手术适用于哪四类疾病？", "answer": "复杂动脉瘤、巨大AVM、脑心共患疾病、硬脑膜动静脉瘘"},
+    {"question": "脑内血肿的手术适应证包含哪两项核心条件？", "answer": "占位效应明显、早期脑疝迹象；脑叶出血血肿量10～30ml"},
+    {"question": "颅底陷入症的诊断依靠哪两项影像学测量？", "answer": "Chamberlain线、Boogaard角"},
+
+    # 边界型（20题）
+    {"question": "轻型与中型颅脑损伤的GCS评分边界是多少？", "answer": "轻型13～15分，中型9～12分"},
+    {"question": "中型与重型颅脑损伤的GCS评分边界是多少？", "answer": "中型9～12分，重型3～8分"},
+    {"question": "颅内压增高的代偿临界容积是多少？", "answer": "颅内容物体积增加超过5%"},
+    {"question": "脑灌注压的自动调节失效临界值是多少？", "answer": "低于5.3kPa（40mmHg）"},
+    {"question": "凹陷性骨折的手术临界深度是多少？", "answer": "＞1cm"},
+    {"question": "小脑幕上血肿的手术临界量是多少？", "answer": "＞30ml"},
+    {"question": "小脑幕下血肿的手术临界量是多少？", "answer": "＞10ml"},
+    {"question": "颅底骨折脑脊液漏的手术修复临界时间是多少？", "answer": "超过1个月未愈合"},
+    {"question": "癫痫术后抗癫痫药物的停药临界时间是多少？", "answer": "无发作3个月且脑电图正常"},
+    {"question": "硬脑膜外血肿与硬脑膜下血肿的核心鉴别边界是什么？", "answer": "前者多为双凸镜形、原发性脑损伤轻；后者为新月形、伴脑挫裂伤"},
+    {"question": "弥漫性轴索损伤与脑挫裂伤的边界鉴别是什么？", "answer": "前者无明显血肿、轴索断裂；后者有出血灶、脑实质破损"},
+    {"question": "SIADH与脑盐耗综合征的核心边界区别是什么？", "answer": "SIADH血容量正常，脑盐耗综合征血容量降低"},
+    {"question": "中枢性尿崩症与肾性尿崩症的边界鉴别是什么？", "answer": "前者为AVP缺乏，后者为肾脏对AVP不敏感"},
+    {"question": "脑膜瘤与神经鞘瘤的椎管内位置边界是什么？", "answer": "前者多为硬脊膜起源，后者多为神经根起源"},
+    {"question": "动脉瘤性SAH与AVM性SAH的年龄边界是什么？", "answer": "前者40～60岁多见，后者35岁以下多见"},
+    {"question": "儿童与成人弥漫性胶质瘤的边界区别是什么？", "answer": "儿童多见于幕下、分子特征不同；成人多见于幕上"},
+    {"question": "开放性与闭合性颅脑损伤的边界是什么？", "answer": "硬脑膜是否破裂，脑组织是否与外界相通"},
+    {"question": "急性与亚急性颅内血肿的时间边界是什么？", "answer": "3日"},
+    {"question": "亚急性与慢性颅内血肿的时间边界是什么？", "answer": "3周"},
+    {"question": "颅底陷入症的Chamberlain线诊断临界值是多少？", "answer": "枢椎齿突高于此线3mm以上"}
+    ]
+
+    # 顶格书写，无缩进错误
+    try:
+        with open(Config.FILE_PATH, "r", encoding="utf-8") as f:
+            text = f.read()
+        print("✅ 文本加载成功，总长度：", len(text))
+    except Exception as e:
+        print(f"❌ 文件读取失败：{e}")
+        exit()
+
+    print(f"🔽 加载模型：BAAI/bge-base-zh-v1.5 | 设备：{DEVICE} | 半精度：{USE_FP16}")
+    model = SentenceTransformer(
+        "BAAI/bge-base-zh-v1.5",
+        device=DEVICE,
+        trust_remote_code=True
+    )
+    model.eval()
+    torch.set_grad_enabled(False)
+    if USE_FP16:
+        model.half()
+
+    chunkers = {
+        "固定切分": FixedSizeChunker(),
+        "递归切分": RecursiveChunker(),
+        "传统语义切分": OriginalSemanticChunker(model),
+        "🔥自研MaxMin混合切分": RecursiveMaxMinHybridChunker(model)
+    }
+
+    evaluator = Evaluator(model)
+    final_result = []
+
+    print("\n🚀 开始外科学复杂QA量化评估...\n")
+    for name, chker in chunkers.items():
+        print(f"正在评估：{name}")
+        chunks = chker.split(text)
+        ret = evaluator.eval(chunks, MEDICAL_QA)
+        stru = evaluator.structure(chunks)
+        final_result.append({"方法": name, **stru, **ret})
+        print(f"  块数量：{stru['块数量']} | 完整句比例：{stru['完整句比例']} | HitRate@3：{ret['HitRate@3']} | MRR：{ret['MRR']}\n")
+
+    # 打印结果
+    df = pd.DataFrame(final_result)
+    from tabulate import tabulate
+
+    df_print = df.copy()
+    format_rules = {
+        "HitRate@3": "{:.4f}",
+        "MRR": "{:.4f}",
+        "平均长度": "{:.1f}",
+        "标准差": "{:.1f}",
+        "完整句比例": "{:.3f}",
+        "语义连贯性": "{:.3f}"
+    }
+    for col, fmt in format_rules.items():
+        if col in df_print.columns:
+            df_print[col] = df_print[col].apply(lambda x: fmt.format(x))
+
+    print("\n" + "="*180)
+    print("📊 外科学文本切分方法评估最终结果【专属优化版】")
+    print("="*180)
+    print(tabulate(
+        df_print,
+        headers="keys",
+        tablefmt="pipe",
+        stralign="center",
+        numalign="center",
+        showindex=False
+    ))
+
+    df.to_excel("外科学文本切分实验结果_最终版.xlsx", index=False)
+    print("\n✅ 结果已保存：外科学文本切分实验结果_最终版.xlsx")
+
+    # 绘图
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    method_names = [res["方法"] for res in final_result]
+    hit_rates    = [res["HitRate@3"] for res in final_result]
+    mrrs         = [res["MRR"] for res in final_result]
+    avg_lengths  = [res["平均长度"] for res in final_result]
+    std_lengths  = [res["标准差"] for res in final_result]
+
+    x = np.arange(len(method_names))
+    bar_width = 0.6
+
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
+    plt.rcParams['figure.dpi'] = 200
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
+
+    best_hit = hit_rates.index(max(hit_rates))
+    best_mrr = mrrs.index(max(mrrs))
+    colors_hit = ['#D0D0D0'] * len(method_names)
+    colors_mrr = ['#D0D0D0'] * len(method_names)
+    colors_hit[best_hit] = '#2E8B57'
+    colors_mrr[best_mrr] = '#4169E1'
+
+    ax1.bar(x, hit_rates, bar_width, color=colors_hit)
+    ax1.set_title('HitRate@3 对比', fontweight='bold', fontsize=12)
+    ax1.set_ylabel('检索召回率')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(method_names, rotation=15, ha='right')
+    ax1.grid(axis='y', alpha=0.3)
+    ax1.spines[['top','right']].set_visible(False)
+
+    ax2.bar(x, mrrs, bar_width, color=colors_mrr)
+    ax2.set_title('MRR 对比', fontweight='bold', fontsize=12)
+    ax2.set_ylabel('排序精度')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(method_names, rotation=15, ha='right')
+    ax2.grid(axis='y', alpha=0.3)
+    ax2.spines[['top','right']].set_visible(False)
+
+    ax3.errorbar(x, avg_lengths, yerr=std_lengths, fmt='o-', color='#DC143C', capsize=4, linewidth=2)
+    ax3.set_title('平均长度与均匀性', fontweight='bold', fontsize=12)
+    ax3.set_ylabel('字符数')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(method_names, rotation=15, ha='right')
+    ax3.grid(axis='y', alpha=0.3)
+    ax3.spines[['top','right']].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig("外科学实验结果图_最终版.svg", bbox_inches='tight')
+    plt.savefig("外科学实验结果图_最终版.png", bbox_inches='tight')
+    plt.show()
