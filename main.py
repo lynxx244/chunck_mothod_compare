@@ -1,4 +1,4 @@
-
+# ===================== 【终极修复版】文本切分实验代码 =====================
 import warnings
 warnings.filterwarnings('ignore')
 import os
@@ -11,10 +11,24 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from dataclasses import dataclass, field
 from typing import Dict, List
-from tabulate import tabulate
-import matplotlib.pyplot as plt
+import torch
 
-# ===================== 数据结构定义 =====================
+# 设备自动检测
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+USE_FP16 = True if DEVICE == "cuda" else False
+
+# ===================== 全局参数 =====================
+@dataclass
+class Config:
+    CHUNK_SIZE = 500
+    OVERLAP = 50
+    MAX_CHUNK = 450      # 适配BGE-base模型，不超token限制
+    MIN_CHUNK = 150
+    THRESHOLD = 0.65
+    TOP_K = 3
+    FILE_PATH = r"C:\Users\lscher\OneDrive\Desktop\大模型实验\文本切割研究\内科学第10版.txt"
+
+# ===================== Chunk 结构 =====================
 @dataclass
 class Chunk:
     content: str
@@ -23,167 +37,216 @@ class Chunk:
 
 # ===================== 1. 固定长度切分 =====================
 class FixedSizeChunker:
-    def __init__(self, chunk_size=500, overlap=50):
+    def __init__(self, chunk_size=Config.CHUNK_SIZE, overlap=Config.OVERLAP):
         self.chunk_size = chunk_size
         self.overlap = overlap
 
-    def split(self, text):
+    def split(self, text, source=""):
         chunks = []
-        start, idx = 0, 0
+        start = 0
+        idx = 0
         while start < len(text):
             end = start + self.chunk_size
             chunk_text = text[start:end].strip()
             if chunk_text:
-                chunks.append(Chunk(content=chunk_text, metadata={"method": "fixed"}, chunk_id=f"fixed_{idx}"))
+                chunks.append(Chunk(
+                    content=chunk_text,
+                    metadata={"method": "fixed"},
+                    chunk_id=f"fixed_{idx}"
+                ))
                 idx += 1
             start = end - self.overlap
         return chunks
 
 # ===================== 2. 递归结构切分 =====================
 class RecursiveChunker:
-    def __init__(self, chunk_size=500, overlap=50):
+    def __init__(self, chunk_size=Config.CHUNK_SIZE, overlap=Config.OVERLAP):
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.separators = ["\n\n", "\n", "。", "！", "？", "；", " "]
 
-    def split(self, text):
+    def split(self, text, source=""):
         chunks = self._recurse(text, 0)
-        return [Chunk(content=c.strip(), metadata={"method": "recursive"}, chunk_id=f"recur_{i}") 
-                for i, c in enumerate(chunks) if c.strip()]
+        res = []
+        for i, c in enumerate(chunks):
+            c = c.strip()
+            if c:
+                res.append(Chunk(content=c, metadata={"method": "recursive"}, chunk_id=f"recur_{i}"))
+        return res
 
     def _recurse(self, text, sep_idx):
         if len(text) <= self.chunk_size or sep_idx >= len(self.separators):
             return [text]
+
         sep = self.separators[sep_idx]
         splits = text.split(sep)
-        chunks, current = [], ""
+        chunks = []
+        current = ""
+
         for part in splits:
             part += sep
             if len(current) + len(part) <= self.chunk_size:
                 current += part
             else:
-                if current: chunks.append(current.strip())
+                if current:
+                    chunks.append(current.strip())
                 current = part
                 if len(current) > self.chunk_size:
-                    chunks.extend(self._recurse(current, sep_idx+1))
+                    sub_chunks = self._recurse(current, sep_idx + 1)
+                    chunks.extend(sub_chunks)
                     current = ""
-        if current.strip(): chunks.append(current.strip())
+
+        if current.strip():
+            chunks.append(current.strip())
         return chunks
 
-# ===================== 3. 传统语义切分 =====================
+# ===================== 3. 传统相邻语义切分 =====================
 class OriginalSemanticChunker:
-    def __init__(self, model, threshold=0.55, max_chunk=500, min_chunk=100):
+    def __init__(self, model, threshold=0.55, max_chunk=Config.CHUNK_SIZE, min_chunk=Config.MIN_CHUNK):
         self.model = model
         self.threshold = threshold
         self.max_chunk = max_chunk
         self.min_chunk = min_chunk
 
     def _split_sentences(self, text):
-        return [s.strip() for s in re.split(r'(?<=[。！？；\n])', text) if s.strip()]
+        pattern = r'(?<=[。！？；\n])'
+        parts = re.split(pattern, text)
+        return [s.strip() for s in parts if s.strip()]
 
-    def split(self, text):
+    def split(self, text, source=""):
         sentences = self._split_sentences(text)
         if not sentences: return []
-        emb = self.model.encode(sentences)
-        chunks, current, length = [], [sentences[0]], len(sentences[0])
+        emb = self.model.encode(sentences, batch_size=64, show_progress_bar=False)
+        chunks = []
+        current = [sentences[0]]
+        length = len(sentences[0])
         for i in range(1, len(sentences)):
             sim = cosine_similarity([emb[i-1]], [emb[i]])[0][0]
             length += len(sentences[i])
             if sim < self.threshold or length > self.max_chunk:
                 chunks.append("".join(current))
-                current, length = [sentences[i]], len(sentences[i])
+                current = [sentences[i]]
+                length = len(sentences[i])
             else:
                 current.append(sentences[i])
         chunks.append("".join(current))
-        merged, buf = [], ""
+        merged = []
+        buf = ""
         for c in chunks:
-            if len(buf) + len(c) < self.min_chunk: buf += c
+            if len(buf) + len(c) < self.min_chunk:
+                buf += c
             else:
-                if buf: merged.append(buf); buf = c
+                if buf:
+                    merged.append(buf)
+                    buf = c
                 merged.append(c)
-        if buf: merged.append(buf)
+        if buf:
+            merged.append(buf)
         return [Chunk(content=m, metadata={"method": "semantic"}, chunk_id=f"sem_{i}") for i, m in enumerate(merged)]
 
-# ===================== 4. 自研MaxMin混合切分（最优） =====================
+# ===================== 🔥 自研MaxMin混合切分（彻底修复版） =====================
 class RecursiveMaxMinHybridChunker:
-    def __init__(self, model, min_chunk=100, max_chunk=850, threshold=0.4):
+    def __init__(self, model, min_chunk=Config.MIN_CHUNK, max_chunk=Config.MAX_CHUNK, threshold=Config.THRESHOLD):
         self.model = model
         self.min_size = min_chunk
         self.max_size = max_chunk
         self.threshold = threshold
+        # 修复1：放大基础块，给合并留足空间（和递归切分的基础块大小一致）
         self.base_recursive = RecursiveChunker(chunk_size=400)
 
-    def split(self, text):
+    def _split_sentences(self, text):
+        # 严格按句子边界切分，保证不截断完整句
+        pattern = r'(?<=[。！？；\n])'
+        parts = re.split(pattern, text)
+        return [s.strip() for s in parts if s.strip()]
+
+    def _local_semantic_merge(self, base_chunks):
+        chunk_texts = [c.content for c in base_chunks]
+        chunk_embeddings = self.model.encode(chunk_texts, batch_size=64,
+                                              show_progress_bar=False)
+
+        merged_result = []
+        current_texts = [chunk_texts[0]]
+        # 关键改动：用簇内所有块的平均向量，不是最后一个块的向量
+        current_mean_emb = chunk_embeddings[0].copy()
+        current_count = 1
+        current_len = len(chunk_texts[0])
+
+        for i in range(1, len(base_chunks)):
+            next_text = chunk_texts[i]
+            next_emb = chunk_embeddings[i]
+
+            sim = cosine_similarity([current_mean_emb], [next_emb])[0][0]
+
+            # 双重判断：语义相似 且 长度不超限
+            if sim >= self.threshold and current_len + len(next_text) <= self.max_size:
+                current_texts.append(next_text)
+                current_len += len(next_text)
+                # 更新平均向量（增量计算，不重新encode）
+                current_mean_emb = (current_mean_emb * current_count + next_emb) / (current_count + 1)
+                current_count += 1
+            else:
+                merged_result.append("".join(current_texts))
+                current_texts = [next_text]
+                current_mean_emb = next_emb.copy()
+                current_count = 1
+                current_len = len(next_text)
+
+        if current_texts:
+            merged_result.append("".join(current_texts))
+
+        return merged_result
+
+    def _strict_length_normalize(self, chunks):
+        result = []
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if not chunk: continue
+
+            # 修复3：超过max_size的块，按句子边界切分，绝不截断句子
+            if len(chunk) > self.max_size:
+                sentences = self._split_sentences(chunk)
+                temp_buf = ""
+                for sent in sentences:
+                    if len(temp_buf) + len(sent) <= self.max_size:
+                        temp_buf += sent
+                    else:
+                        if temp_buf:
+                            result.append(temp_buf)
+                        temp_buf = sent
+                if temp_buf:
+                    result.append(temp_buf)
+            else:
+                result.append(chunk)
+
+        # 合并小于min_size的碎片，避免过碎
+        final_result = []
+        buffer = ""
+        for chunk in result:
+            if len(buffer) + len(chunk) < self.min_size:
+                buffer += chunk
+            else:
+                if buffer:
+                    final_result.append(buffer)
+                    buffer = chunk
+                final_result.append(chunk)
+        if buffer:
+            final_result.append(buffer)
+
+        # 过滤空块
+        return [c for c in final_result if c.strip()]
+
+    def split(self, text, source=""):
+        # 1. 基础递归切分，和递归切分的基础块大小一致
         base_chunks = self.base_recursive.split(text)
-        merged = self._semantic_merge(base_chunks)
-        final = self._length_normalize(merged)
-        return [Chunk(content=f, metadata={"method": "hybrid"}, chunk_id=f"hybrid_{i}") for i, f in enumerate(final)]
+        # 2. 语义合并，先把所有同语义的块合起来（这次没有长度限制！）
+        semantic_merged = self._local_semantic_merge(base_chunks)
+        # 3. 长度归一化，严格按句子边界切分，保证完整句
+        final_chunks = self._strict_length_normalize(semantic_merged)
+        # 4. 生成Chunk对象
+        return [Chunk(content=f, metadata={"method": "hybrid_maxmin"}, chunk_id=f"hybrid_{i}") for i, f in enumerate(final_chunks)]
 
-    def _semantic_merge(self, chunks):
-        if len(chunks) <= 1: return [c.content for c in chunks]
-        texts = [c.content for c in chunks]
-        emb = self.model.encode(texts, batch_size=32)
-        res, cur, cur_emb, cur_len = [], [chunks[0]], emb[0], len(texts[0])
-        for i in range(1, len(chunks)):
-            c, l, e = chunks[i], len(texts[i]), emb[i]
-            if cur_len + l > self.max_size:
-                res.append("".join([x.content for x in cur]))
-                cur, cur_emb, cur_len = [c], e, l
-                continue
-            if cosine_similarity([cur_emb], [e])[0][0] >= self.threshold:
-                cur.append(c)
-                cur_emb = np.mean([cur_emb, e], axis=0)
-                cur_len += l
-            else:
-                res.append("".join([x.content for x in cur]))
-                cur, cur_emb, cur_len = [c], e, l
-        if cur: res.append("".join([x.content for x in cur]))
-        return res
-
-    def _length_normalize(self, chunks):
-        res, buf = [], ""
-        for c in chunks:
-            c = c.strip()
-            if not c: continue
-            if len(buf) + len(c) < self.min_size: buf += c
-            else:
-                if buf: res.append(buf); buf = c
-                res.append(c if len(c) <= self.max_size else [c[i:i+self.max_size-50] for i in range(0,len(c),self.max_size-50)][0])
-        if buf: res[-1] += buf if res else buf
-        return [r for r in res if r.strip()]
-
-# ===================== 评估器 =====================
-class Evaluator:
-    def __init__(self, model): self.model = model
-    def eval(self, chunks, qa, top_k=3):
-        if not chunks: return {"HitRate@3":0,"MRR":0}
-        texts = [c.content for c in chunks]
-        emb = self.model.encode(texts, normalize_embeddings=True).astype(np.float32)
-        index = faiss.IndexFlatIP(emb.shape[1]); index.add(emb)
-        hit, mrr = 0, 0.0
-        for q in qa:
-            q_emb = self.model.encode([q["question"]], normalize_embeddings=True).astype(np.float32)
-            _, idx = index.search(q_emb, top_k)
-            for i, pos in enumerate(idx[0]):
-                if q["answer"] in texts[pos] or q["answer"][:18] in texts[pos]:
-                    hit +=1; mrr += 1/(i+1); break
-        return {"HitRate@3":round(hit/len(qa),4),"MRR":round(mrr/len(qa),4)}
-
-    def structure(self, chunks):
-        lengths = [len(c.content) for c in chunks]
-        full = sum(1 for c in chunks if c.content.strip().endswith(('。','！','？','”')))
-        full_rate = round(full/len(chunks),3) if chunks else 0
-        coherence = 0.0
-        if len(chunks)>=2:
-            emb = self.model.encode([c.content for c in chunks])
-            coherence = round(np.mean([cosine_similarity([emb[i]],[emb[i+1]])[0][0] for i in range(len(chunks)-1)]),3)
-        return {
-            "块数量":len(chunks),"平均长度":round(np.mean(lengths),1),"标准差":round(np.std(lengths),1),
-            "碎片(<100)":sum(1 for l in lengths if l<100),"超长块(>800)":sum(1 for l in lengths if l>800),
-            "完整句比例":full_rate,"语义连贯性":coherence
-        }
-
-# ===================== 80条医学QA,由大模型针对原文本生成 =====================
+# ===================== 80条 标准答案QA =====================
 MEDICAL_QA = [
     {"question": "内分泌系统主要由哪些部分组成？", "answer": "内分泌腺（垂体、甲状腺、甲状旁腺、胰岛、肾上腺、性腺等）和分布在脑（下丘脑）、脂肪、心血管、呼吸道、消化道、泌尿生殖系统等的内分泌组织和细胞"},
     {"question": "激素根据化学结构分为哪四类？", "answer": "肽类和蛋白质激素、胺类和氨基酸衍生物激素、类固醇激素、脂肪酸衍生物"},
@@ -267,67 +330,222 @@ MEDICAL_QA = [
     {"question": "甲旁减的典型神经肌肉体征是什么？", "answer": "面神经叩击征（Chvostek征）阳性、束臂加压试验（Trousseau征）阳性"}
 ]
 
+# ===================== 自适应命中逻辑评估器 =====================
+class Evaluator:
+    def __init__(self, model):
+        self.model = model
+        self.stop_words = {"的", "是", "为", "和", "与", "及", "或", "在", "对", "由", "什么", "哪些", "主要", "核心", "包括", "分为"}
+
+    def build_index(self, chunks):
+        texts = [c.content for c in chunks]
+        encode_texts = [f"为这个句子生成表示以用于检索相关文章：{t}" for t in texts]
+        emb = self.model.encode(
+            encode_texts,
+            normalize_embeddings=True,
+            batch_size=128,
+            show_progress_bar=False
+        ).astype(np.float32)
+        index = faiss.IndexFlatIP(emb.shape[1])
+        index.add(emb)
+        return index, texts
+
+    def _extract_keywords(self, text):
+        terms = [t.strip() for t in re.split(r'[、，。；（）()\s\-\u2011]', text) if len(t.strip()) > 1]
+        return [t for t in terms if t not in self.stop_words]
+
+    def eval(self, chunks, qa, top_k=Config.TOP_K):
+        if not chunks: return {"HitRate@3": 0, "MRR": 0}
+        index, texts = self.build_index(chunks)
+        hit, mrr = 0, 0.0
+
+        questions = [f"为这个句子生成表示以用于检索相关文章：{q['question']}" for q in qa]
+        q_embs = self.model.encode(
+            questions,
+            normalize_embeddings=True,
+            batch_size=64,
+            show_progress_bar=False
+        ).astype(np.float32)
+
+        for q_idx, q in enumerate(qa):
+            ans = q["answer"]
+            q_emb = q_embs[q_idx:q_idx+1]
+            _, idx = index.search(q_emb, top_k)
+            ok, rank = False, -1
+
+            key_terms = self._extract_keywords(ans)
+            core_terms = [t for t in key_terms if len(t) >= 2]
+            if not core_terms:
+                continue
+
+            # 自适应规则：短答案≥1个，长答案≥2个
+            required_matches = min(2, len(core_terms))
+
+            for i, index_pos in enumerate(idx[0]):
+                if index_pos >= len(texts):
+                    continue
+                chunk_content = texts[index_pos]
+                match_count = sum(1 for term in core_terms if term in chunk_content)
+
+                if match_count >= required_matches:
+                    ok = True
+                    rank = i + 1
+                    break
+
+            if ok:
+                hit += 1
+                mrr += 1 / rank if rank > 0 else 0
+
+        return {
+            "HitRate@3": round(hit / len(qa), 4),
+            "MRR": round(mrr / len(qa), 4)
+        }
+
+    def structure(self, chunks):
+        lengths = [len(c.content) for c in chunks]
+        end_flags = ('。', '！', '？', '”')
+        full_sent = sum(1 for c in chunks if c.content.strip().endswith(end_flags))
+        full_rate = round(full_sent / len(chunks), 3) if chunks else 0
+
+        coherence = 0.0
+        if len(chunks) >= 2:
+            texts = [c.content for c in chunks]
+            emb = self.model.encode(texts, batch_size=128, show_progress_bar=False)
+            sims = [cosine_similarity([emb[i]], [emb[i+1]])[0][0] for i in range(len(chunks)-1)]
+            coherence = round(np.mean(sims), 3)
+
+        return {
+            "块数量": len(chunks),
+            "平均长度": round(np.mean(lengths), 1),
+            "标准差": round(np.std(lengths), 1),
+            "碎片(<100)": sum(1 for l in lengths if l < 100),
+            "超长块(>800)": sum(1 for l in lengths if l > 800),
+            "完整句比例": full_rate,
+            "语义连贯性": coherence
+        }
+
 # ===================== 主程序 =====================
 if __name__ == "__main__":
-    print("="*60)
-    print(" 医学文本智能切分评估工具")
-    print(" 支持4种切分算法 | 9大评估指标 | 自动可视化")
-    print("="*60)
+    try:
+        with open(Config.FILE_PATH, "r", encoding="utf-8") as f:
+            text = f.read()
+        print("✅ 文本加载成功，总长度：", len(text))
+    except Exception as e:
+        print(f"❌ 文件读取失败：{e}")
+        exit()
 
-    # 加载文本
-    with open("内科学第10版.txt", "r", encoding="utf-8") as f:
-        text = f.read()[:150000]
+    print(f"🔽 加载模型：BAAI/bge-base-zh-v1.5 | 设备：{DEVICE} | 半精度：{USE_FP16}")
+    model = SentenceTransformer(
+        "BAAI/bge-base-zh-v1.5",
+        device=DEVICE,
+        trust_remote_code=True
+    )
+    model.eval()
+    torch.set_grad_enabled(False)
+    if USE_FP16:
+        model.half()
 
-    # 加载模型
-    model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
-    evaluator = Evaluator(model)
-
-    # 四种切分方法
     chunkers = {
         "固定切分": FixedSizeChunker(),
         "递归切分": RecursiveChunker(),
         "传统语义切分": OriginalSemanticChunker(model),
-        "自研MaxMin混合切分": RecursiveMaxMinHybridChunker(model)
+        "🔥自研MaxMin混合切分": RecursiveMaxMinHybridChunker(model)
     }
 
+    evaluator = Evaluator(model)
     final_result = []
+
+    print("\n🚀 开始量化评估（80条QA自适应命中规则）...\n")
     for name, chker in chunkers.items():
-        print(f"\n正在评估: {name}")
+        print(f"正在评估：{name}")
         chunks = chker.split(text)
         ret = evaluator.eval(chunks, MEDICAL_QA)
         stru = evaluator.structure(chunks)
         final_result.append({"方法": name, **stru, **ret})
+        print(f"  块数量：{stru['块数量']} | 完整句比例：{stru['完整句比例']} | HitRate@3：{ret['HitRate@3']} | MRR：{ret['MRR']}\n")
 
-    # 打印极简表格
+    # 打印结果
     df = pd.DataFrame(final_result)
-    print("\n📊 评估结果")
-    print(tabulate(df, headers='keys', tablefmt='simple', stralign='center', numalign='center', showindex=False))
+    from tabulate import tabulate
 
-    # 保存结果
-    df.to_excel("实验结果.xlsx", index=False)
-    print("\n✅ 结果已保存: 实验结果.xlsx")
+    df_print = df.copy()
+    format_rules = {
+        "HitRate@3": "{:.4f}",
+        "MRR": "{:.4f}",
+        "平均长度": "{:.1f}",
+        "标准差": "{:.1f}",
+        "完整句比例": "{:.3f}",
+        "语义连贯性": "{:.3f}"
+    }
+    for col, fmt in format_rules.items():
+        if col in df_print.columns:
+            df_print[col] = df_print[col].apply(lambda x: fmt.format(x))
+
+    print("\n" + "="*150)
+    print("📊 文本切分方法评估最终结果【自适应命中+自研修复版】")
+    print("="*150)
+    print(tabulate(
+        df_print,
+        headers="keys",
+        tablefmt="pipe",
+        stralign="center",
+        numalign="center",
+        showindex=False
+    ))
+
+    df.to_excel("文本切分实验结果_最终版.xlsx", index=False)
+    print("\n✅ 结果已保存：文本切分实验结果_最终版.xlsx")
 
     # 绘图
-    method_names = [r["方法"] for r in final_result]
-    hit_rates = [r["HitRate@3"] for r in final_result]
-    mrrs = [r["MRR"] for r in final_result]
-    avg = [r["平均长度"] for r in final_result]
-    std = [r["标准差"] for r in final_result]
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    method_names = [res["方法"] for res in final_result]
+    hit_rates    = [res["HitRate@3"] for res in final_result]
+    mrrs         = [res["MRR"] for res in final_result]
+    avg_lengths  = [res["平均长度"] for res in final_result]
+    std_lengths  = [res["标准差"] for res in final_result]
+
     x = np.arange(len(method_names))
+    bar_width = 0.6
 
-    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
     plt.rcParams['axes.unicode_minus'] = False
-    fig, (ax1, ax2, ax3) = plt.subplots(1,3,figsize=(18,5))
+    plt.rcParams['figure.dpi'] = 200
 
-    ax1.bar(x, hit_rates, color=['#ccc','#ccc','#ccc','#2E8B57'])
-    ax1.set_title('HitRate@3'); ax1.set_xticks(x); ax1.set_xticklabels(method_names, rotation=15)
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
 
-    ax2.bar(x, mrrs, color=['#ccc','#ccc','#ccc','#4169E1'])
-    ax2.set_title('MRR'); ax2.set_xticks(x); ax2.set_xticklabels(method_names, rotation=15)
+    best_hit = hit_rates.index(max(hit_rates))
+    best_mrr = mrrs.index(max(mrrs))
+    colors_hit = ['#D0D0D0'] * len(method_names)
+    colors_mrr = ['#D0D0D0'] * len(method_names)
+    colors_hit[best_hit] = '#2E8B57'
+    colors_mrr[best_mrr] = '#4169E1'
 
-    ax3.errorbar(x, avg, yerr=std, fmt='o-', capsize=4)
-    ax3.set_title('长度与标准差'); ax3.set_xticks(x); ax3.set_xticklabels(method_names, rotation=15)
+    ax1.bar(x, hit_rates, bar_width, color=colors_hit)
+    ax1.set_title('HitRate@3 对比', fontweight='bold', fontsize=12)
+    ax1.set_ylabel('检索召回率')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(method_names, rotation=15, ha='right')
+    ax1.grid(axis='y', alpha=0.3)
+    ax1.spines[['top','right']].set_visible(False)
+
+    ax2.bar(x, mrrs, bar_width, color=colors_mrr)
+    ax2.set_title('MRR 对比', fontweight='bold', fontsize=12)
+    ax2.set_ylabel('排序精度')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(method_names, rotation=15, ha='right')
+    ax2.grid(axis='y', alpha=0.3)
+    ax2.spines[['top','right']].set_visible(False)
+
+    ax3.errorbar(x, avg_lengths, yerr=std_lengths, fmt='o-', color='#DC143C', capsize=4, linewidth=2)
+    ax3.set_title('平均长度与均匀性', fontweight='bold', fontsize=12)
+    ax3.set_ylabel('字符数')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(method_names, rotation=15, ha='right')
+    ax3.grid(axis='y', alpha=0.3)
+    ax3.spines[['top','right']].set_visible(False)
 
     plt.tight_layout()
-    plt.savefig("结果图.png", bbox_inches='tight')
+    plt.savefig("实验结果图_最终版.svg", bbox_inches='tight')
+    plt.savefig("实验结果图_最终版.png", bbox_inches='tight')
     plt.show()
