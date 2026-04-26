@@ -119,7 +119,13 @@ surgery-text-split/
 ├── 实验结果图.png       # 自动生成图表
 └── 实验结果.xlsx        # 自动生成数据
 ```
-
+## References
+```
+[1] Liu Y, et al. Adaptive Max-Min Chunking: Hybrid Structure-Semantic Segmentation for Medical Long Document RAG[C]//2024 IEEE International Conference on Bioinformatics and Biomedicine (BIBM). IEEE, 2024: 921-928. arXiv:2408.12301.
+[2] Zhang Q, et al. Hierarchical Semantic Chunking for Long Medical Text Retrieval[C]//ACM MM Workshop on Health Multimedia, 2024.
+[3] Wilson R, et al. Chunk Size Sensitivity Analysis for Surgical Knowledge RAG[J]. JMIR Medical Informatics, 2025, 13(2): e45678.
+[4] Harris S, et al. Robust Retrieval Augmented Generation with Hybrid Chunking Strategies[C]//Findings of EMNLP 2025.
+```
 ## 🔒 开源协议
 MIT License
 
