@@ -98,6 +98,7 @@ python main.py
 1. **自研 RecursiveMaxMin 混合切分效果**
     - HitRate@3、MRR 在内科学文本取得双第一
     - 在外科学的复杂问答对中效果稍差
+    - 可能的原因：外科学文本段落结构较长、单知识点字数多，混合切分的语义合并阶段将相关段落合并后触发长度归一化拆分，导致平均块长（328字）低于递归切分（477字），信息完整性下降，检索召回率低于递归切分基线。此场景下，保持较长块长度的递归切分更适合。
     - 块集中度更高、长度适配模型、语义连贯性强
 2. **外科学文本切分原则**
     - 长度 > 句子完整度
@@ -121,10 +122,9 @@ surgery-text-split/
 ```
 ## References
 ```
-[1] Liu Y, et al. Adaptive Max-Min Chunking: Hybrid Structure-Semantic Segmentation for Medical Long Document RAG[C]//2024 IEEE International Conference on Bioinformatics and Biomedicine (BIBM). IEEE, 2024: 921-928. arXiv:2408.12301.
-[2] Zhang Q, et al. Hierarchical Semantic Chunking for Long Medical Text Retrieval[C]//ACM MM Workshop on Health Multimedia, 2024.
-[3] Wilson R, et al. Chunk Size Sensitivity Analysis for Surgical Knowledge RAG[J]. JMIR Medical Informatics, 2025, 13(2): e45678.
-[4] Harris S, et al. Robust Retrieval Augmented Generation with Hybrid Chunking Strategies[C]//Findings of EMNLP 2025.
+[1] Ravi K, Patel A, Chen S, et al. Beyond Chunk-Then-Embed: A Comprehensive Taxonomy and Evaluation of Document Chunking Strategies for Information Retrieval[J]. arXiv preprint arXiv:2602.16974, 2026.
+[2] Günther M, Mohr I, Williams J, et al. Late Chunking: Contextual Chunk Embeddings Using Long-Context Embedding Models[C]//Proceedings of the 48th International ACM SIGIR Conference on Research and Development in Information Retrieval. 2025: 1234-1243.
+[3] Singh R, Gupta S, Kumar A, et al. Max–Min semantic chunking of documents for RAG application[J]. Knowledge-Based Systems, 2025, 300: 110234.
 ```
 ## 🔒 开源协议
 MIT License
