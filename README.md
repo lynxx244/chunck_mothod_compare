@@ -348,6 +348,8 @@ medical-text-chunking/
 └──外科学.pdf
 └──内科学.pdf
 └──内科学.txt
+|
+|——config.py
 ```
 
 ---
